@@ -35,11 +35,11 @@ namespace Microsoft.Azure.Relay.Bridge
             this.targetServer = targetServer;
             this.targetPort = targetPort;
 
-            
-            if ( http )
+
+            if (http)
             {
                 var httpHandler = new HttpClientHandler();
-                if ( insecure )
+                if (insecure)
                 {
                     httpHandler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
                 }
@@ -56,54 +56,60 @@ namespace Microsoft.Azure.Relay.Bridge
         {
             EventTraceActivity handleConnectionActivity = BridgeEventSource.NewActivity("HandleTcpConnection");
 
-            using (TcpClient client = new TcpClient())
+            try
             {
-                client.NoDelay = true;
-                client.SendBufferSize = client.ReceiveBufferSize = 65536;
-                client.SendTimeout = 60000;
-                if (config.BindAddress != null)
+                using (TcpClient client = new TcpClient())
                 {
-                    var computerProperties = IPGlobalProperties.GetIPGlobalProperties();
-                    var unicastAddresses = computerProperties.GetUnicastAddresses();
-                    IList<IPAddress> ipAddresses = null;
+                    client.NoDelay = true;
+                    client.SendBufferSize = client.ReceiveBufferSize = 65536;
+                    client.SendTimeout = 60000;
+                    if (config.BindAddress != null)
+                    {
+                        var computerProperties = IPGlobalProperties.GetIPGlobalProperties();
+                        var unicastAddresses = computerProperties.GetUnicastAddresses();
+                        IList<IPAddress> ipAddresses = null;
 
-                    ipAddresses = IPAddress.TryParse(config.BindAddress, out var ipAddress)
-                        ? new[] { ipAddress }
-                        : Dns.GetHostEntry(config.BindAddress).AddressList;
+                        ipAddresses = IPAddress.TryParse(config.BindAddress, out var ipAddress)
+                            ? new[] { ipAddress }
+                            : Dns.GetHostEntry(config.BindAddress).AddressList;
 
-                    List<IPAddress> eligibleAddresses = new List<IPAddress>();
-                    eligibleAddresses.AddRange(from hostAddress in ipAddresses
-                                               where IPAddress.IsLoopback(hostAddress)
-                                               select hostAddress);
-                    eligibleAddresses.AddRange(from unicastAddress in unicastAddresses
-                                               join hostAddress in ipAddresses on unicastAddress.Address equals hostAddress
-                                               where !IPAddress.IsLoopback(hostAddress)
-                                               select hostAddress);
-                    // pick one of those eligible endpoints
-                    client.Client.Bind(new IPEndPoint(eligibleAddresses[rnd.Next(eligibleAddresses.Count)], 0));
+                        List<IPAddress> eligibleAddresses = new List<IPAddress>();
+                        eligibleAddresses.AddRange(from hostAddress in ipAddresses
+                                                   where IPAddress.IsLoopback(hostAddress)
+                                                   select hostAddress);
+                        eligibleAddresses.AddRange(from unicastAddress in unicastAddresses
+                                                   join hostAddress in ipAddresses on unicastAddress.Address equals hostAddress
+                                                   where !IPAddress.IsLoopback(hostAddress)
+                                                   select hostAddress);
+                        // pick one of those eligible endpoints
+                        client.Client.Bind(new IPEndPoint(eligibleAddresses[rnd.Next(eligibleAddresses.Count)], 0));
+                    }
+                    await client.ConnectAsync(targetServer, targetPort).ConfigureAwait(false);
+                    var tcpstream = client.GetStream();
+
+                    BridgeEventSource.Log.RemoteForwardTcpSocketAccepted(handleConnectionActivity, $"{targetServer}:{targetPort}");
+
+                    CancellationTokenSource socketAbort = new CancellationTokenSource();
+                    await Task.WhenAll(
+                        StreamPump.RunAsync(hybridConnectionStream, tcpstream,
+                            () => client.Client.Shutdown(SocketShutdown.Send), socketAbort.Token)
+                            .ContinueWith((t) => socketAbort.Cancel(), TaskContinuationOptions.OnlyOnFaulted),
+                        StreamPump.RunAsync(tcpstream, hybridConnectionStream, () => hybridConnectionStream.Shutdown(), socketAbort.Token))
+                            .ContinueWith((t) => socketAbort.Cancel(), TaskContinuationOptions.OnlyOnFaulted);
+
                 }
-                await client.ConnectAsync(targetServer, targetPort).ConfigureAwait(false);
-                var tcpstream = client.GetStream();
-
-                BridgeEventSource.Log.RemoteForwardTcpSocketAccepted(handleConnectionActivity, $"{targetServer}:{targetPort}");
-
-                CancellationTokenSource socketAbort = new CancellationTokenSource();
-                await Task.WhenAll(
-                    StreamPump.RunAsync(hybridConnectionStream, tcpstream,
-                        () => client.Client.Shutdown(SocketShutdown.Send), socketAbort.Token)
-                        .ContinueWith((t) => socketAbort.Cancel(), TaskContinuationOptions.OnlyOnFaulted),
-                    StreamPump.RunAsync(tcpstream, hybridConnectionStream, () => hybridConnectionStream.Shutdown(), socketAbort.Token))
-                        .ContinueWith((t) => socketAbort.Cancel(), TaskContinuationOptions.OnlyOnFaulted);
-
             }
-
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+            }
         }
 
-       
+
         public async Task HandleRequest(RelayedHttpListenerContext ctx)
         {
             EventTraceActivity handleRequestActivity = BridgeEventSource.NewActivity("HandleRequest");
-            
+
             DateTime startTimeUtc = DateTime.UtcNow;
             try
             {
@@ -143,13 +149,13 @@ namespace Microsoft.Azure.Relay.Bridge
             }
 
             string relativePath = context.Request.Url.GetComponents(UriComponents.PathAndQuery, UriFormat.Unescaped);
-            if ( relativePath.StartsWith(this.relaySubpath) )
-            { 
+            if (relativePath.StartsWith(this.relaySubpath))
+            {
                 relativePath = relativePath.Substring(this.relaySubpath.Length);
                 if (relativePath.StartsWith("/"))
                 {
                     relativePath = relativePath.Substring(1);
-                }                
+                }
             }
             requestMessage.RequestUri = new Uri(httpClient.BaseAddress, relativePath);
             requestMessage.Method = new HttpMethod(context.Request.HttpMethod);
@@ -202,6 +208,6 @@ namespace Microsoft.Azure.Relay.Bridge
             context.Response.Close();
         }
 
-        
+
     }
 }
